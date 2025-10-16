@@ -10,6 +10,173 @@ from pathlib import Path
 from datetime import date
 import io
 import pdfplumber
+import pyodbc
+from datetime import datetime, timedelta
+
+#BASE DE FATURAMENTOS/CLIENTES    
+def obter_faturamento_sql():
+    try:
+        #lê excel
+        df_construtoras = pd.read_excel(
+            "Integrador Ambar.xlsx",
+            sheet_name="LISTA DE CONSTRUTORAS",
+            usecols=["EMPRESA", "CÓDIGO"]
+        )
+        df_construtoras.rename(columns={"EMPRESA": "Construtora", "CÓDIGO": "Telex"}, inplace=True)
+        df_construtoras["Telex"] = df_construtoras["Telex"].astype(str).str.strip()
+
+        #conexão sql server
+        conn = pyodbc.connect(
+            "DRIVER={ODBC Driver 17 for SQL Server};"
+            "SERVER=45.6.154.46,1819;"
+            "DATABASE=CVNIMG_134415_PR_PD;"
+            "UID=CLT134415READ;"
+            "PWD=edwna17483AYGMJ@!;"
+        )
+
+        data_12_meses_atras = (datetime.now() - timedelta(days=365)).strftime('%Y%m%d')
+        cf_lista = [
+            5101,5102,5116,5120,5122,5123,5124,5125,5401,5403,5933,
+            6101,6102,6107,6108,6116,6120,6122,6124,6125,6401,6403,
+            6501,6502,6933,7101,7102,6109,6123,5405
+        ]
+        placeholders = ",".join("?" * len(cf_lista))
+
+        #JOIN da SC6G10 (faturamento) com SA1G10 (clientes)
+        query = f"""
+        SELECT 
+            C6.C6_PRODUTO AS [Código],
+            C6.C6_QTDVEN AS [Quantidade],
+            C6.C6_VALOR AS [Valor],
+            C6.C6_CLI AS [Código Cliente],
+            C6.C6_LOJA AS [Loja Faturamento],
+            C6.C6_DATFAT AS [Data Faturamento],
+            C6.C6_CF AS [CF],
+            A1.A1_NOME AS [Nome Cliente],
+            A1.A1_CGC AS [CNPJ/CPF],
+            A1.A1_TELEX AS [Telex],
+            A1.A1_LOJA AS [Loja Cliente]
+        FROM SC6G10 C6
+        LEFT JOIN SA1G10 A1 
+            ON A1.A1_COD = C6.C6_CLI 
+           AND A1.A1_LOJA = C6.C6_LOJA
+        WHERE C6.D_E_L_E_T_ <> '*' 
+          AND C6.C6_BLQ <> 'R' 
+          AND C6.C6_DATFAT >= ? 
+          AND C6.C6_CF IN ({placeholders})
+        """
+
+        df_faturamento = pd.read_sql(query, conn, params=[data_12_meses_atras] + cf_lista)
+        conn.close()
+
+        # Ajustes de formato
+        df_faturamento["Código"] = df_faturamento["Código"].astype(str).str.zfill(6)
+        df_faturamento["Data Faturamento"] = pd.to_datetime(df_faturamento["Data Faturamento"], errors="coerce")
+        df_faturamento["Telex"] = df_faturamento["Telex"].astype(str).str.strip()
+        df_final = df_faturamento.merge(df_construtoras, on="Telex", how="left")
+
+        colunas = ["Construtora", "Nome Cliente", "Código Cliente", "Loja Cliente", "CNPJ/CPF", "Data Faturamento", "Telex", "CF",
+            "Código", "Quantidade", "Valor"]
+        
+        df_final = df_final[[c for c in colunas if c in df_final.columns]]
+
+        #Classificação por faturamento
+        df_classificacao = (
+            df_final.groupby("Construtora", as_index=False)["Valor"]
+            .sum()
+            .rename(columns={"Valor": "Faturamento Total"})
+        )
+
+        def classificar_tamanho(fat):
+            if fat < 300000:
+                return "P"
+            elif 300000 <= fat < 500000:
+                return "M"
+            elif 500000 <= fat < 900000:
+                return "G"
+            else:
+                return "GG"
+
+        df_classificacao["Tamanho"] = df_classificacao["Faturamento Total"].apply(classificar_tamanho)
+        df_classificacao["Faturamento Total"] = df_classificacao["Faturamento Total"].apply(
+            lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        )
+
+        ordem_tamanhos = ["GG", "G", "M", "P"]
+        df_classificacao["Tamanho"] = pd.Categorical(df_classificacao["Tamanho"], categories=ordem_tamanhos, ordered=True)
+        df_classificacao = df_classificacao.sort_values(by="Tamanho", ascending=True)
+
+        # junta novamente com df_final (caso queira ver junto dos registros)
+        df_final = df_final.merge(df_classificacao, on="Construtora", how="left")
+        df_final["Preço Unitário"] = df_final["Valor"] / df_final["Quantidade"]
+
+        df_media_preco = (
+            df_final.groupby(["Código", "Tamanho"], as_index=False)["Preço Unitário"]
+            .mean()
+            .rename(columns={"Preço Unitário": "Preço Médio"})
+        )
+
+        # formata em reais
+        df_media_preco["Preço Médio"] = df_media_preco["Preço Médio"].apply(
+            lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+
+        # ordena pelo tamanho (GG, G, M, P)
+        ordem_tamanhos = ["GG", "G", "M", "P"]
+        df_media_preco["Tamanho"] = pd.Categorical(df_media_preco["Tamanho"], categories=ordem_tamanhos, ordered=True)
+        df_media_preco = df_media_preco.sort_values(["Código", "Tamanho"])
+
+        return df_final, df_classificacao, df_media_preco
+
+    except Exception as e:
+        st.error(f"Erro ao obter faturamento via SQL Server: {e}")
+        print(f"Erro ao obter faturamento via SQL Server: {e}")
+        return pd.DataFrame()
+
+
+st.sidebar.header("📑 Base de Faturamento")
+#controla a exibição
+if "mostrar_faturamento" not in st.session_state:
+    st.session_state.mostrar_faturamento = False
+if "mostrar_classificacao" not in st.session_state:
+    st.session_state.mostrar_classificacao = False
+if "mostrar_media_preco" not in st.session_state:
+    st.session_state.mostrar_media_preco = False
+
+# Botões na barra lateral
+if st.sidebar.button("📊 Faturamento Detalhado"):
+    st.session_state.mostrar_faturamento = not st.session_state.mostrar_faturamento
+if st.sidebar.button("🏗️ Categorização de Clientes"):
+    st.session_state.mostrar_classificacao = not st.session_state.mostrar_classificacao
+if st.sidebar.button("💰 Média de Preços por Tamanho"):
+    st.session_state.mostrar_media_preco = not st.session_state.mostrar_media_preco
+
+if "dados_carregados" not in st.session_state:
+    st.session_state.df_faturamento, st.session_state.df_classificacao, st.session_state.df_media_preco = obter_faturamento_sql()
+    st.session_state.dados_carregados = True
+
+if st.session_state.mostrar_faturamento:
+    df_faturamento = st.session_state.df_faturamento
+    if not df_faturamento.empty:
+        total_registros = len(df_faturamento)
+        data_min = df_faturamento["Data Faturamento"].min()
+        data_max = df_faturamento["Data Faturamento"].max()
+        st.subheader("📊 Faturamento (Últimos 12 Meses)")
+        st.write(f"**Total de registros:** {total_registros:,}")
+        st.write(f"**Período:** {data_min.date()} ➜ {data_max.date()}")
+        st.dataframe(df_faturamento, hide_index=True)
+    else:
+        st.warning("⚠️ Nenhum dado de faturamento foi retornado.")
+
+if st.session_state.mostrar_classificacao:
+    df_classificacao = st.session_state.df_classificacao
+    st.subheader("🏗️ Categorização de Clientes por Faturamento")
+    st.dataframe(df_classificacao, hide_index=True)
+
+if st.session_state.mostrar_media_preco:
+    df_media_preco = st.session_state.df_media_preco
+    st.subheader("💰 Média de Preço por Produto e Tamanho de Cliente")
+    st.dataframe(df_media_preco, hide_index=True)
+
 
 # config inicial da pág
 st.set_page_config(page_title="Calculadora de Precificação", layout="wide")
@@ -18,7 +185,7 @@ st.markdown("### Parâmetros")
 
 col1, col2 = st.columns(2)
 with col1:
-    tipo_operacao = st.selectbox("Tipo de operação", ["Margem fixa", "Preço final fixo"])
+    tipo_operacao = st.selectbox("Tipo de operação", ["Preço final fixo", "Margem fixa"])
 with col2:
     segmento = st.selectbox("Cliente", ["Construtora", "Canais"])
 
@@ -222,7 +389,6 @@ def carregar_base_cpv():
     return df_cpv
 df_base_cpv = carregar_base_cpv()
 df_cpv_filtrado = df_base_cpv[["Código", "Descrição", "CPV"]]
-
 
 # obter IPI da api
 def obter_ipi_ncm_api():
@@ -482,6 +648,7 @@ if not df_ipi_ncm.empty:
             for col in resultados.columns:
                 st.session_state.df_editado[col] = resultados[col]
 
+
     df = st.session_state.df_editado.copy()
     colunas_principais = ["Código", "Descrição", "NCM", "CPV", "IPI", "Coeficiente"]
     if tipo_operacao == "Margem fixa":
@@ -642,6 +809,7 @@ if not df_ipi_ncm.empty:
                                 novo_df], ignore_index=True)
                     st.session_state.produtos_temp = []
                     st.success("Todos os produtos foram adicionados com sucesso!")
+    
 if st.session_state.get('mostrar_tabela_visualizacao', True):
     st.markdown("---")
     st.markdown("### Tabela de Visualização")
@@ -674,7 +842,132 @@ if st.session_state.get('mostrar_tabela_visualizacao', True):
             df_visualizacao[col] = df_visualizacao[col].apply(
                 lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(
                     x) and isinstance(x, (int, float)) else x)
-    st.dataframe(df_visualizacao, use_container_width=True)
+    st.dataframe(df_visualizacao, use_container_width=True, hide_index=True)
+
+# Função para obter os preços do TOTVS
+def obter_preco_totvs_api():
+    try:
+        url = "http://ambartech134415.protheus.cloudtotvs.com.br:1807/rest/api/v1/calccomponentesorc2022/tabelapreco"
+        response = requests.get(url, auth=HTTPBasicAuth("ambar.integracao", "!ambar@2025int"))
+        response.raise_for_status()
+        dados_api = response.json()
+        df_preco = pd.DataFrame(dados_api)
+
+        # Filtrar apenas colunas necessárias
+        colunas_desejadas = ["DA1_CODTAB", "DA1_CODPRO", "DA1_PRCVEN"]
+        df_preco = df_preco[colunas_desejadas]
+
+        # Filtrar apenas a tabela de preço P01
+        df_preco = df_preco[df_preco["DA1_CODTAB"] == "P01"]
+
+        df_preco.rename(columns={ "DA1_CODPRO": "Código", "DA1_PRCVEN": "Preço do TOTVS" }, inplace=True)
+        df_preco["Código"] = df_preco["Código"].astype(str).str.zfill(6)
+        df_preco["Preço do TOTVS"] = pd.to_numeric(df_preco["Preço do TOTVS"], errors="coerce")
+        return df_preco[["Código", "Preço do TOTVS"]]
+    except Exception as e: 
+        st.error(f"Erro ao obter preços da API TOTVS: {e}") 
+        return pd.DataFrame(columns=["Código", "Preço do TOTVS"])
+    
+#analise de tabela
+with st.sidebar:
+    st.markdown("---")
+    if "mostrar_analise_tabela" not in st.session_state:
+        st.session_state.mostrar_analise_tabela = False
+
+    if st.button("📊 Análise de tabela"):
+        st.session_state.mostrar_analise_tabela = not st.session_state.mostrar_analise_tabela
+
+if st.session_state.mostrar_analise_tabela:
+    try:
+        df_visualizacao = st.session_state.df_editado.copy()
+        if "Preço s/ IPI" in df_visualizacao.columns:
+            df_produtos_visualizacao = df_visualizacao[df_visualizacao["Preço s/ IPI"].notna()].copy()
+        else:
+            df_produtos_visualizacao = df_visualizacao.copy()
+
+        # Obtém preços do TOTVS
+        df_preco_totvs = obter_preco_totvs_api()
+        df_produtos_visualizacao["Código"] = df_produtos_visualizacao["Código"].astype(str).str.zfill(6)
+
+        # Faz merge com os preços do TOTVS
+        df_analise = pd.merge(
+            df_produtos_visualizacao[["Código", "Descrição", "Preço s/ IPI", "CPV", "Margem Bruta"]],
+            df_preco_totvs,
+            on="Código",
+            how="left"
+        )
+
+        df_faturamento = obter_faturamento_sql()
+        if not df_faturamento.empty and "Código" in df_faturamento.columns:
+            # Exemplo de agregação do faturamento (total dos últimos 12 meses por produto)
+            if "C6_VALOR" in df_faturamento.columns:
+                df_faturamento_agg = df_faturamento.groupby("Código")["C6_VALOR"].sum().reset_index()
+                #df_faturamento_agg.rename(columns={"C6_VALOR": "Faturamento 12M"}, inplace=True)
+
+                df_analise = pd.merge(df_analise, df_faturamento_agg, on="Código", how="left")
+            else:
+                st.warning("Coluna de valor de faturamento (C6_VALOR) não encontrada em SC6G10.")
+        else:
+            st.warning("Nenhum dado de faturamento retornado do SQL Server.")
+
+        # Cálculos
+        df_analise["Preço Acordo s/ Juros"] = df_analise["Preço s/ IPI"] / 1.0047
+        df_analise["Desconto_num"] = 1 - (df_analise["Preço Acordo s/ Juros"] / df_analise["Preço do TOTVS"])
+        df_analise["Desconto"] = df_analise["Desconto_num"].apply(
+            lambda x: f"{x:.2%}" if pd.notna(x) and isinstance(x, (int, float)) else "N/A"
+        )
+
+        # Formatação monetária
+        for col in ["Preço s/ IPI", "Preço do TOTVS", "Preço Acordo s/ Juros", "CPV"]:
+            if col in df_analise.columns:
+                df_analise[col] = df_analise[col].apply(
+                    lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                    if pd.notna(x) and isinstance(x, (int, float))
+                    else "N/A"
+                )
+
+        # Formatação de margem
+        if "Margem Bruta" in df_analise.columns:
+            df_analise["Margem Bruta"] = df_analise["Margem Bruta"].apply(
+                lambda x: f"{x:.2f}%" if pd.notna(x) and isinstance(x, (int, float)) else "N/A"
+            )
+
+        # Função para colorir a coluna de desconto
+        def colorir_desconto(val):
+            if pd.isna(val):
+                return ''
+            elif val < 0:
+                return 'background-color: #ADD8E6; color: black;'   # azul
+            elif 0 <= val < 0.07:
+                return 'background-color: #008000; color: white;'   # verde
+            elif 0.07 <= val < 0.15:
+                return 'background-color: #FFFF00; color: black;'   # amarelo
+            elif 0.15 <= val < 0.50:
+                return 'background-color: #FF9999; color: black;'   # vermelho claro
+            elif val >= 0.50:
+                return 'background-color: #880808; color: white;'   # vermelho escuro
+            else:
+                return ''
+
+        # Aplica o estilo de cor com base no valor numérico
+        styled_df = (
+            df_analise.drop(columns=["Desconto_num"], errors="ignore")
+            .style.apply(
+                lambda s: [colorir_desconto(v) for v in df_analise["Desconto_num"]],
+                subset=["Desconto"]
+            )
+        )
+
+        # Exibe a tabela
+        st.subheader("📊 Análise de Tabela")
+        st.dataframe(styled_df, use_container_width=True, hide_index=True)
+
+        # Armazena para uso posterior
+        st.session_state.df_analise_tabela = df_analise.drop(columns=["Desconto_num"], errors="ignore").copy()
+
+    except Exception as e:
+        st.error(f"Erro ao gerar análise da tabela: {e}")
+
 
 with st.sidebar:
     st.markdown("---")
@@ -699,30 +992,33 @@ with st.sidebar:
         else:
             tipo_tabela = "Tabela por Margem"
         st.write(f"**Tipo de Tabela:** {tipo_tabela}")
-        # Campos do formulário - exibir progressivamente conforme preenchimento
+        # Campos do formulário
         tipo_documento = st.sidebar.selectbox("Tipo de documento", ["Acordo Corporativo", "Proposta de negociação"])
-        # Cliente é obrigatório para mostrar próximos campos
         cliente = st.sidebar.text_input("Nome do cliente*")
-        if cliente:
-            uf = st.sidebar.multiselect("UF*",
+        uf = st.sidebar.multiselect("UF*",
                                         ["AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO", "MA", "MT", "MS", "MG",
                                          "PA",
                                          "PB", "PR", "PE", "PI", "RJ", "RN", "RS", "RO", "RR", "SC", "SP", "SE", "TO"])
-            if uf:
-                tipo_cliente = st.sidebar.selectbox("Tipo de cliente*", ["Construtora", "Revenda", "Industrialização"])
-                if tipo_cliente:
-                    st.write(f"**Condição de Pagamento:** {cond_pagamento}")
-                    st.write(f"**Frete:** {'Incluso' if frete_incluso else 'Não incluso'}")
+        tipo_cliente = st.sidebar.selectbox("Tipo de cliente*", ["Construtora", "Revenda", "Industrialização"])
+        st.write(f"**Condição de Pagamento:** {cond_pagamento}")
+        st.write(f"**Frete:** {'Incluso' if frete_incluso else 'Não incluso'}")
 
-                    pedido_minimo = st.sidebar.text_input("Pedido mínimo (R$)")
-                    potencial_faturamento = st.sidebar.text_input("Potencial de faturamento (R$)")
-                    duracao_acordo = st.sidebar.text_input("Duração do acordo")
-                    data_proposta = st.sidebar.text_input("Data da Proposta")
-                    observacoes = st.sidebar.text_area("Observações")
+        pedido_minimo = st.sidebar.text_input("Pedido mínimo (R$)")
+        potencial_faturamento = st.sidebar.text_input("Potencial de faturamento (R$)")
+        duracao_acordo = st.sidebar.text_input("Duração do acordo")
+        data_proposta = st.sidebar.text_input("Data da Proposta")
+        observacoes = st.sidebar.text_area("Observações")
 
-                    colunas_disponiveis = ["Linha", "Código", "Descrição", "NCM", "Imagem", "Preço sem IPI", "IPI (%)",
-                                           "Preço com IPI"]
-                    colunas_exibidas = st.sidebar.multiselect("Colunas da tabela de itens", colunas_disponiveis,default=colunas_disponiveis)
+        colunas_disponiveis = {"Código": "Código", "Descrição": "Descrição", "NCM": "NCM", "Imagem": "Imagem", "Preço sem IPI": "Preço s/ IPI", "IPI (%)": "IPI (%)", "Preço com IPI": "Preço c/ IPI"}
+        # Salvar a escolha no session_state para usar também no PDF
+        if "colunas_exibidas" not in st.session_state:
+            st.session_state.colunas_exibidas = list(colunas_disponiveis.keys())
+
+        st.session_state.colunas_exibidas = st.sidebar.multiselect(
+            "Colunas da tabela de itens",
+            list(colunas_disponiveis.keys()),
+            default=st.session_state.colunas_exibidas
+        )
         # Botão para controlar a exibição da prévia
         if 'mostrar_previa' not in st.session_state:
             st.session_state.mostrar_previa = False
@@ -740,24 +1036,29 @@ with st.sidebar:
 @st.cache_data
 def carregar_imagens():
     try:
-        url = "https://docs.google.com/spreadsheets/d/1XgI23B79U50I2mhw1Wfgd9cfE4PZoDq1e793i7zoBcU/export?format=csv&gid=0"
-        df = pd.read_csv(url, on_bad_lines='skip')
-        df = df.rename(columns={
-            "Código": "código certo",
-            "Imagem": "valor"})
-        colunas_necessarias = ['código certo', 'valor']
-        colunas_existentes = [col for col in colunas_necessarias if col in df.columns]
-        if len(colunas_existentes) < len(colunas_necessarias):
-            st.error(f"Colunas faltantes: {set(colunas_necessarias) - set(colunas_existentes)}")
-            st.error(f"Colunas disponíveis: {df.columns.tolist()}")
+        # Caminho local do arquivo Excel
+        caminho_excel = Path("Base de imagens (1).xlsx")
+
+        if not caminho_excel.exists():
+            st.error("❌ Arquivo 'imagens_produtos.xlsx' não encontrado na pasta do projeto.")
             st.stop()
-        df = df[colunas_necessarias]
-        df = df.dropna(subset=colunas_necessarias)
-        imagens_dict = dict(zip(df['código certo'], df['valor']))
+
+        # Lê a planilha Excel da aba 'Página1'
+        df = pd.read_excel(caminho_excel, sheet_name="Página1", usecols=[0, 1], header=None)
+        df.columns = ["código certo", "valor"]  # Coluna A = código, Coluna B = link da imagem
+
+        # Remove linhas vazias
+        df = df.dropna(subset=["código certo", "valor"])
+
+        # Cria o dicionário código → imagem
+        imagens_dict = dict(zip(df["código certo"].astype(str).str.zfill(6), df["valor"]))
+
         return imagens_dict
+
     except Exception as e:
-        st.error(f"Erro ao carregar imagens: {e}")
+        st.error(f"Erro ao carregar imagens do Excel: {e}")
         st.stop()
+
 imagens_dict = carregar_imagens()
 def gerar_tabela_acordo():
     # Verificar se há dados na tabela de visualização
@@ -765,14 +1066,10 @@ def gerar_tabela_acordo():
         st.warning("Nenhum produto disponível para gerar o acordo.")
         return None
     df_acordo = st.session_state.df_editado[
-        st.session_state.df_editado["Preço s/ IPI"].notna()
-    ].copy()
+        st.session_state.df_editado["Preço s/ IPI"].notna()].copy()
     if df_acordo.empty:
         st.warning("Nenhum produto selecionado para o acordo.")
         return None
-        # Adicionar coluna de linha numerada
-    df_acordo.insert(0, 'Linha', range(1, len(df_acordo) + 1))
-    # Preparar colunas para o acordo
     if "IPI" in df_acordo.columns:
         df_acordo['IPI (%)'] = df_acordo['IPI']
     for col in ['Preço s/ IPI', 'Preço c/ IPI']:
@@ -790,13 +1087,21 @@ def gerar_tabela_acordo():
             return "Sem imagem"
     if "Código" in df_acordo.columns:
         df_acordo['Imagem'] = df_acordo['Código'].apply(obter_imagem)
-    # Selecionar e ordenar colunas para o acordo
-    colunas_acordo = ['Linha', 'Código', 'Descrição', 'NCM', 'Imagem',
-                      'Preço s/ IPI', 'IPI (%)', 'Preço c/ IPI']
-    colunas_existentes = [col for col in colunas_acordo if col in df_acordo.columns]
-    df_acordo_final = df_acordo[colunas_existentes]
-    return df_acordo_final
+    # Utiliza sempre as colunas selecionadas no multiselect
+    colunas_disponiveis = {
+        "Código": "Código",
+        "Descrição": "Descrição",
+        "NCM": "NCM",
+        "Imagem": "Imagem",
+        "Preço sem IPI": "Preço s/ IPI",
+        "IPI (%)": "IPI (%)",
+        "Preço com IPI": "Preço c/ IPI"
+    }
+    colunas_usuario = st.session_state.get("colunas_exibidas", list(colunas_disponiveis.keys()))
+    colunas_reais = [colunas_disponiveis[c] for c in colunas_usuario if colunas_disponiveis[c] in df_acordo.columns]
 
+    df_acordo_final = df_acordo[colunas_reais]
+    return df_acordo_final
 # Gerar prévia do acordo (aparece/desaparece ao clicar)
 if st.session_state.mostrar_formulario_acordo and st.session_state.mostrar_previa:
     # Verificar se campos obrigatórios estão preenchidos
@@ -1059,9 +1364,12 @@ if baixar_pdf and st.session_state.mostrar_formulario_acordo:
                     "tabela_itens": st.session_state.df_editado.copy()}
                 st.session_state.historico_acordos.append(novo_acordo)
                 salvar_historico_json()
-                html_tabela = df_acordo.to_html(
-                    escape=False, index=False, classes='tabela-itens',
-                    border=0, justify='left')
+                # Garante que só as colunas selecionadas pelo usuário vão para o PDF
+                colunas_usuario = st.session_state.get("colunas_exibidas", list(df_acordo.columns))
+                df_acordo_pdf = df_acordo[[col for col in colunas_usuario if col in df_acordo.columns]]
+                #html_tabela = df_acordo_pdf.to_html(escape=False, index=False, classes='tabela-itens', border=0, justify='left')
+                html_tabela = df_acordo.to_html(escape=False, index=False, classes='tabela-itens', border=0, justify='left')
+
                 logo_path = Path("logo_polar.png")
                 if logo_path.exists():
                     with open(logo_path, "rb") as logo_file:
